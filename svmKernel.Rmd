@@ -1,0 +1,503 @@
+---
+title: "Support Vector Machines for Titanic Survival"
+author: 'Craig "Doc" Savage'
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 2
+    code_folding: show
+---
+
+```{r setup, include=TRUE, echo=FALSE}
+## Settings
+knitr::opts_chunk$set( message=FALSE, warning=FALSE, echo=TRUE, eval=TRUE )
+
+## Constants
+# Probability of correct classification of baseline model
+# In this case, the baseline model assumes survival if and only if the passenger is female.
+BASELINE_PCC = scales::percent( 0.76555 )
+# Rule-based
+RULE_PCC = scales::percent( 0.67464 )
+EXPERT_PCC = RULE_PCC
+# First cut with RBF and "reasonable" settings
+SVM_PCC1 = scales::percent( 0.78947 )
+# Expected overtrained SVM
+SVM_PCC_WORST = scales::percent( 0.71291 )
+# Restricting the variables
+SVM_SMALL_PCC = scales::percent( 0.78947 )
+# And the metric from my SVM on public test data/leaderboard
+SVM_PCC_BEST = scales::percent( 0.79425 )
+```
+
+# Executive Summary
+
+I had a go at utilising support vector machines (SVM) on the Titanic Survival data, with as little wrangling of the data as feasible. It seems that the algorithm is quite consistent - various parameter settings resulted in public test set results of `r SVM_PCC_WORST` to `r SVM_PCC_BEST`. Oddly, this is in-line with the simple prediction algorithm of *A passenger survived if and only if they were female*, at `r BASELINE_PCC`.
+
+The point of this kernel is to show that complexity does not always yield better results. Obviously, as this is a historical data set, it is possible to have a perfect score without any classification whatsoever. This is acknowledged in the [Rules](https://www.kaggle.com/c/titanic/rules) as given:
+
+> This is a fun competition aimed at helping you get started with machine learning.  While the Titanic dataset is publically available on the internet, looking up the answers defeats the entire purpose.  So seriously, don't do that.
+
+# Introduction{.tabset .tabset-fade .tabset-pills}
+
+Kaggle hosts a number of competitions - most famously those that offer monetary rewards to the "best" model submissions. In addition, Kaggle hosts ongoing competitions, intended to 
+
+## Scope
+
+When starting a data science project, I like to take a moment to set expectations and boundaries. If you're working on a project, these may be stated in a business case, a contract, or some other formal document. 
+
+It should further be noted that, often, these are seen as mere guidelines....
+
+### In Scope
+
+Within this kernel, I shall:
+
+* Solve the classification problem using Support Vector Machines and various rule-based methods.  
+* Compare the performance of these on the supplied training and test data sets.  
+* Give examples of creating additional variables, implementation, and monitoring.
+
+
+### Out of Scope
+
+In this kernel, I shall not:
+
+* Pursue external data sets. This includes the obvious "Look up the passenger manifest and survival" option.  
+* Utilise other classification methods (e.g. decision trees, neural networks, etc). If you'd like to extend this work to include other methods, feel free to copy/fork/etc this kernel.  
+* Build ensemble models. It is possible to "nest" SVMs - use a simple one to generate a prediction, include this prediction as an input to another SVM, etc. It's also possible to ensemble them, as in random forests: By using techniques from random forests, you can create a collection of SVMs and utilise voting to generate predictions. Again, if you'd like to try such techniques, feel free to copy/fork/etc this kernel and have a go.
+
+## Library Load
+
+I've loaded some libraries to aid in this kernel. Specifically:
+
+1. `tidyverse`: Conveniently loads `dplyr`, `forcats`, `ggplot2` and others that I often use.   
+2. `e1071`: A package for `svm` and related utilities.
+3. `scales`: Convenience in terms of formatting percentages. In fact, I've used this package in the preamble, so if it's not installed you'll have discovered it by now.
+4. `rhandsontable`: Based on `Handsontable.js`, this allows for some nice formatting of tables.
+5. `googleVis`: A gauge is given as monitoring the metric of probability of correct classification.
+
+```{r libraryLoad}
+# Tidyverse for most of the code
+library( tidyverse )
+# e1071 for svm (support vector machine) functions
+library( e1071 )
+# scales for percentage formatting
+library( scales )
+# rhandsontable for sample results
+library( rhandsontable )
+# googleVis for monitoring via gauge
+library( googleVis )
+```
+
+## Data Load
+
+As is common for Kaggle competitions, there are training and test sets that have been pre-defined.
+
+```{r dataLoad}
+rawTrainData <- readr::read_csv( 'train.csv' ) %>%
+  mutate( Source='Train' )
+rawTestData <- readr::read_csv( 'test.csv' ) %>%
+  mutate( Source='Test' )
+
+# Combine the data for ease of later processing
+rawData <- bind_rows( rawTrainData, rawTestData )
+```
+
+## Data Cleaning
+
+The data have some missing values for Age, which I expect to be an important variable. I've replaced these missing values with zero.
+
+Also, I suspect that `SibSp` and `Parch` are ordinal, rather than continuous. I've included logic to convert those to factors rather than integers.
+
+```{r dataClean} 
+cleanData <- rawData %>%
+  # Change the class to a character ("C" class -> Character class)
+  mutate( Cclass = as.character( Pclass ) ) %>%
+  # Replace missing doubles with 0.0
+  mutate_if( is.double, list( ~if_else( is.na( . ), 0.0, . ) ) ) %>%
+  # Convert logicals to characters
+  mutate_if( is_logical, as.character ) %>%
+  # Convert characters to factors
+  mutate_if( is_character, fct_explicit_na ) %>%
+  # Convert some other variables to factors....
+  mutate( Survived=as_factor( Survived ) # For classification
+          , SibSp=as_factor( SibSp ) # Ordinal variable
+          , Parch=as_factor( Parch ) # Ordinal variable 
+          ) %>%
+  # Pclass is no longer needed, and there are many missings for Cabin, so ditch it.
+  select( -Pclass, -Cabin ) 
+
+# Re-split into training and test
+trainData <- cleanData %>%
+  filter( Source == 'Train' )
+
+testData <- cleanData %>%
+  filter( Source == 'Test' ) %>%
+  # The Survived flag in test doesn't mean anything in the test data - remove it
+  select( -Survived )
+```
+
+## Additional Variables
+
+In general, I recommend consulting experts to determine if there are any additional variables or interactions to consider. An obvious (but unspirited) external data source would be the passenger manifest and survival from the Titanic. 
+
+For illustrative purposes, I'll add a couple of variables:
+
+```{r variableAddition}
+trainData <- trainData %>%
+  mutate( 
+        # Create a variable for "Women and Children"
+        Priority=as.integer( Sex == 'female' | # Women 
+                               ((Age > 0) & Age < 18) # Children
+                             )
+        # I assume that if the fare is 0, then the record represents a crew member
+        # This implies there are 18 crew members, which seems small for a large ship!
+          , Crew=as.integer( Fare == 0 ) )
+testData <- testData %>%
+    mutate( 
+        # Create a variable for "Women and Children"
+        Priority=as.integer( Sex == 'female' | # Women 
+                               ((Age > 0) & Age < 18) # Children
+                             )
+        # I assume that if the fare is 0, then the record represents a crew member
+        # This implies there are 18 crew members, which seems small for a large ship!
+          , Crew=as.integer( Fare == 0 ) )
+```
+
+# Model Derivation
+
+
+## Expert Models
+
+### Baseline 
+
+Kaggle provides a baseline model for comparison and to check the submission process. Their rule is simple: *A passenger survived if and only if they were female*. Utilising this simple rule yields a metric of `r BASELINE_PCC`. Obviously, any model should be compared to this benchmark.
+
+```{r baseModel}
+baseTrain <- trainData %>%
+  mutate( predSurv=if_else( Sex == 'female', 1, 0 ) )
+
+baseTest <- testData %>%
+  mutate( Survived = if_else( Sex == 'female', 1, 0 ) )
+```
+
+### Expert Judgment
+
+I'm being a bit ironic calling myself an expert in whether or not people survived the Titantic tragedy. But, I've done an exploratory data analysis, played with some SVM models, and wanted to benchmark my observations formally before continuing with more complicated options. 
+
+The rule is slightly more complicated than the base Kaggle model: *If the passenger was female, or under 18, or in first class, they survived*. 
+
+```{r expertModel1}
+expertTrain <- trainData %>%
+  mutate( predSurv = as.integer( (Sex == 'female') |
+                                   ((Age > 0) & (Age < 18)) |
+                                   (Cclass == 1) ) )
+  
+expertTest <- testData %>%
+  mutate( Survived = as.integer( (Sex == 'female') |
+                                   ((Age > 0) & (Age < 18)) |
+                                   (Cclass == 1) )
+  ) %>%
+  select( PassengerId, Survived ) 
+
+write.csv( expertTest, file='expertSurvival.csv', row.names=FALSE )
+```
+
+Utilising this model yields a result of `r RULE_PCC`, which is worse than the baseline model.
+
+Humbled but defiant, I've selected this model to be assessed against the private test data.
+
+
+## SVM Models{.tabset .tabset-fade .tabset-pills}
+
+Support Vector Machines are a means of solving classification, regression, and anomaly detection problems. They were popular in the 1990's and early 2000's, leading to the question as to whether they would solve all problems or overhyped, but seem to have fallen out of favour[^1].
+
+[^1]: This leads me to believe that the overhyped argument won. But it's also made me skeptical when people ask the same about deep learning, etc.
+
+They are defined by solutions to a constrained optimisation problem, leveraging the rich mathematics from convex optimisation. Often, a so-called *kernel trick* is employed to simplify the process - there is further mathematics around what functions are admissible as such kernels. 
+
+### Introductory Model
+
+I've played with SVMs in previous jobs. Based on my memory, I tried using a cost ($C$) of $10$, and a $\gamma$ value of $0.1$. I checked this on a small sample of data to see if it (roughly) aligned with the predictions.
+
+```{r svmSimpleFit}
+simpleSVM <- svm( Survived ~ Sex + Age + Cclass + Priority + Crew
+                   , data=trainData
+                   , na.action=na.fail
+                   , kernel='radial'
+                   , cost = 10
+                   , gamma= 0.1 )
+
+# I'm not extending the trainData with another variable in case I
+# need to go back and revisit the training.
+# I learned this the hard way!
+predSurvivalClass <- predict( simpleSVM, newdata=trainData )
+trainData0 <- trainData %>% mutate( predSurv=predSurvivalClass )
+sampleData0 <- trainData0 %>% 
+  select( Sex, Age, Cclass, Survived, predSurv  ) %>% 
+  sample_n( 10 ) %>%
+  mutate( Correct = (Survived == predSurv) )
+
+# The rhandsontable is a nice table to visualise the results, and allows for formatting
+sampleTable0 <- rhandsontable( sampleData0 %>% select( -Correct )
+                              , rowHeaders=NULL
+                              , row_highlight=
+                                # The underlying JS is 0-based, hence the "-1"
+                                (which( !sampleData0$Correct, arr.ind=TRUE )-1) ) %>%
+  # Make the table interactive to clicks
+  hot_table( highlightRow = TRUE, highlightCol = TRUE ) %>% 
+  # The rhandsontable documentation has some good examples of JS to highlight. 
+  # Once you have some good examples, you can re-use them easily!
+  hot_cols( renderer="
+            function(instance, td, row, col, prop, value, cellProperties) {
+              Handsontable.renderers.TextRenderer.apply(this, arguments);
+      
+              tbl = this.HTMLWidgets.widgets[0]
+
+              hrows = tbl.params.row_highlight
+              hrows = hrows instanceof Array ? hrows : [hrows] 
+
+              if( hrows.includes( row ) ){
+                  td.style.background = 'red';
+              }
+
+
+              return td;
+            }
+            ")
+sampleTable0
+
+testData0 <- testData %>% mutate( Survived=predict( simpleSVM, newdata=. ) ) 
+outData0 <- testData0 %>% select( PassengerId, Survived )
+write.csv( outData0, file='smallSVM.csv', row.names=FALSE )
+```
+
+### All Variables
+
+Although it's unclear (to me) how the family, port, and fare may influence the model, the SVM can "determine" whether such variables are useful. My next step was to build a model with all of these variables.
+
+Note that I've excluded the name and identifier variables as I'm not sure how to extend them to the test data.
+
+```{r svmFit}
+titanicSVM <- svm( Survived ~ Sex + Age + SibSp + Parch + Cclass + Embarked + Priority + Crew
+                   , data=trainData
+                   , na.action=na.fail
+                   , kernel='radial'
+                   , cost = 10
+                   , gamma= 0.1 )
+
+predSurvivalClass <- predict( titanicSVM, newdata=trainData )
+trainData1 <- trainData %>% mutate( predSurv=predSurvivalClass )
+sampleData1 <- trainData1 %>% 
+  select( Sex, Age, Cclass, Survived, predSurv  ) %>% 
+  sample_n( 10 ) %>%
+  mutate( Correct = (Survived == predSurv) )
+sampleTable1 <- rhandsontable( sampleData1
+                               , rowHeaders = NULL
+                              , row_highlight=
+                                # The underlying JS is 0-based, hence the "-1"
+                                (which( !sampleData1$Correct, arr.ind=TRUE )-1) ) %>%
+  # The rhandsontable documentation has some good examples of JS to highlight. 
+  # Once you have some good examples, you can re-use them easily!
+  hot_cols( renderer="
+            function(instance, td, row, col, prop, value, cellProperties) {
+              Handsontable.renderers.TextRenderer.apply(this, arguments);
+      
+              tbl = this.HTMLWidgets.widgets[0]
+
+              hrows = tbl.params.row_highlight
+              hrows = hrows instanceof Array ? hrows : [hrows] 
+
+              if( hrows.includes( row ) ){
+                  td.style.background = 'red';
+              }
+
+
+              return td;
+            }
+            ")
+sampleTable1
+
+testData1 <- testData %>% mutate( Survived=predict( titanicSVM, newdata=. ) ) 
+outData1 <- testData1 %>% select( PassengerId, Survived )
+write.csv( outData1, file='kaggleSurvivalBigSVM.csv', row.names = FALSE )
+```
+
+### Tuning the SVM
+
+Try tuning if you'd like. I did this *twice* using different parameter settings: Once had no change, and the second led to my current submission on the leaderboard. I recommend against running this if you're just after an introduction -- but if you have the time, feel free to change the ranges, settings, and have a go!
+
+```{r tuneSVM, eval=FALSE}
+# Set the random number seed so that this is repeatable
+set.seed( 42 )
+tuneSVM <- tune( svm
+                 , Survived ~ Sex + Age + SibSp + Parch + Cclass + Embarked + Priority + Crew
+                 , data=trainData
+                 , ranges=list( cost=10^seq( from=-1, to=3, by=0.25 )
+                                , gamma=10^seq(from=-2, to=1, by=0.2 ) )
+                 , tunecontrol=tune.control( sampling='boot' )
+)
+
+testData2 <- testData1 %>% 
+  mutate( Survived2=predict( tuneSVM$best.model, newdata=. ) ) 
+outData2 <- testData2 %>% 
+  select( PassengerId, Survived=Survived2 )
+
+write.csv( outData2, file='tunedSurvival.csv', row.names=FALSE )
+
+# Have a look at what's different...
+swapSet <- testData2 %>% 
+  filter( Survived != Survived2 ) %>%
+  sample_n( min( n( ), 5 ) )
+
+if( nrow( swapSet ) > 0 )
+  knitr::kable( swapSet, caption='Example differences between tuned and untuned SVMs' )
+
+```
+
+### Nu ($\nu$) SVM
+
+An attractive feature of SVM is the ability to explicity restrict the complexity. Whilst this may result in lesser performance, it has a number of positive aspects, including:   
+
+1. It helps guard against overtraining, and  
+2. It reduces complexity for implementation purposes.
+
+```{r nuSVM}
+nuSVM <- svm( Survived ~ Sex + Age + SibSp + Parch + Cclass + Embarked + Priority + Crew
+                   , data=trainData
+                   , type='nu-classification'
+                   , nu=0.0025
+                   , na.action=na.fail
+                   , kernel='radial'
+                   , cost = 10
+                   , gamma= 0.1 )
+
+predSurvivalClass <- predict( titanicSVM, newdata=trainData )
+trainDataNu <- trainData %>% mutate( predSurv=predSurvivalClass )
+sampleDataNu <- trainDataNu %>% 
+  select( Sex, Age, Cclass, Survived, predSurv  ) %>% 
+  sample_n( 10 ) %>%
+  mutate( Correct = (Survived == predSurv) )
+sampleTableNu <- rhandsontable( sampleDataNu
+                                , rowHeaders = NULL
+                              , row_highlight=
+                                # The underlying JS is 0-based, hence the "-1"
+                                (which( !sampleDataNu$Correct, arr.ind=TRUE )-1) ) %>%
+  # The rhandsontable documentation has some good examples of JS to highlight. 
+  # Once you have some good examples, you can re-use them easily!
+  hot_cols( renderer="
+            function(instance, td, row, col, prop, value, cellProperties) {
+              Handsontable.renderers.TextRenderer.apply(this, arguments);
+      
+              tbl = this.HTMLWidgets.widgets[0]
+
+              hrows = tbl.params.row_highlight
+              hrows = hrows instanceof Array ? hrows : [hrows] 
+
+              if( hrows.includes( row ) ){
+                  td.style.background = 'red';
+              }
+
+
+              return td;
+            }
+            ")
+sampleTableNu
+
+testDataNu <- testData %>% mutate( Survived=predict( titanicSVM, newdata=. ) ) 
+outDataNu <- testDataNu %>% select( PassengerId, Survived )
+write.csv( outDataNu, file='nuSurvival.csv', row.names = FALSE )
+```
+
+
+# Recommendations{.tabset .tabset-fade .tabset-pills}
+
+I have two groups of recommendations: 
+
+1. **Implementation**: While building the model and generating predictions is straightforward in an evironment built for statistical programming, many organisations have different (or *very* different) production environments. Along with the model, it is good practice to include instructions and test cases so that there is assurance that the implemented model is working as intended.
+Note there's a trade-off in performance versus complexity. Whether or not the improved performance is "worth" the complexity is a business decision that should be considered carefully.  
+2. **Monitoring**: Once the model is implemented, the users of the model should have assurance that the model continues to work correctly. How much variation in model performance is "normal"? Is model performance better (or worse) in certain situations? With many machine learning models, it is difficult to assess what external factors influence prediction accuracy.  
+
+
+## Implementation
+
+Before deciding upon which model to implement, let's consider the complexity and performance of the SVM models created:
+
+```{r summFunc}
+getTrainPerf <- function( metricData ){
+  trainPerf <- with( metricData, mean( as.numeric( predSurv == Survived ) ) )
+  return( trainPerf )
+}
+```
+
+Model | Number of Variables | Number of Support Vectors | Training Perf | Test Perf |
+------|---------------------|---------------------------|---------------|-----------|
+Baseline | 1 | **N/A** | `r scales::percent( getTrainPerf( baseTrain ) )` | `r BASELINE_PCC`
+Expert | 1 | **N/A** | `r scales::percent( getTrainPerf( expertTrain ) )` | `r EXPERT_PCC`
+Small | 5 | `r simpleSVM$tot.nSV` | `r scales::percent(getTrainPerf( trainData0 ) )` |  `r SVM_SMALL_PCC`
+Full | 8 | `r titanicSVM$tot.nSV` | `r scales::percent( getTrainPerf( trainData1 ) )` |  `r SVM_PCC1`
+Nu | 8 | `r nuSVM$tot.nSV` | `r scales::percent( getTrainPerf( trainDataNu ) )` |  Z
+
+
+## Monitoring
+
+Whilst this particular problem has a single application, in general models will require monitoring to ensure their ongoing performance is aligned with its performance in development. One method to do this is with a gauge. These are quite simple, and provide a good means to quickly visualise performance of a continuous value. In this case, it's the probability of correct classification.
+
+This requires feedback about the limits of what should be considered *good*, *marginal* and *unsatisfactory* performance levels. For sake of argument, let's say that performance of over 80\% is considered *good*, over 70\% is marginal, and below that is *unsatisfactory*.
+
+If there were additional metrics - for instance, the PCC for different segments -- these could be extended in the gauges. As an example, I've split the data into components of Overall, Men, and Women.
+
+I don't know how my chosen model will work on the private test data, so whether or not my model will be rated green on the private data remains to be seen!
+
+```{r gaugeVis, results='asis', tidy=FALSE}
+MAX_GREEN = 1
+MIN_GREEN = 0.8
+MAX_YELLOW = MIN_GREEN
+MIN_YELLOW = 0.7
+MAX_RED = MIN_YELLOW
+MIN_RED = 0
+
+gaugeDF <- # Get the metrics....
+  tibble( Overall=getTrainPerf( trainDataNu )
+                       , Men=getTrainPerf( trainDataNu %>% filter( Sex == 'male' ) )
+                       , Women=getTrainPerf( trainDataNu %>% filter( Sex == 'female' ) ) 
+              )%>%
+  # Transform from fat & wide to thin & long
+  tidyr::gather( key=Metric, value=PCC ) %>%
+  # googleVis wants this to be a data frame
+  as.data.frame()
+
+myGauge <- gvisGauge( gaugeDF
+                      , labelvar='Metric'
+                      , numvar = 'PCC'
+                      , options=list( min=0, max=1
+                                      , greenFrom=MIN_GREEN, greenTo=MAX_GREEN
+                                      , yellowFrom=MIN_YELLOW, yellowTo=MAX_YELLOW
+                                      , redFrom=MIN_RED, redTo=MAX_RED )
+                      )
+
+print( myGauge, tag='chart' ) 
+```
+
+
+# Conclusions
+
+
+# Acknowledgements
+
+In building this, I'd like to thank the following:
+
+1. [Kaggle](https://www.kaggle.com), for hosting the data and the [open competition](https://www.kaggle.com/c/titanic).
+
+2. `jrowan` for the [`rhandsontable` package, and its documentation](http://jrowen.github.io/rhandsontable/)
+
+3. giphy.com for making animated GIFs for extra pizzazz in this kernel.
+
+# Appendix
+
+## Session Info
+
+The `sessionInfo()` used in the creation of this document is below. It's a place to start if there are difficulties reproducing this report (i.e. check `R` version, package versions, etc.).
+
+```{r sessionInfo}
+sessionInfo()
+```
