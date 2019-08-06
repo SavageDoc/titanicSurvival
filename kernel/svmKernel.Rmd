@@ -76,7 +76,7 @@ I've loaded some libraries to aid in this kernel. Specifically:
 1. `tidyverse`: Conveniently loads `dplyr`, `forcats`, `ggplot2` and others that I often use.   
 2. `e1071`: A package for `svm` and related utilities.
 3. `scales`: Convenience in terms of formatting percentages. In fact, I've used this package in the preamble, so if it's not installed you'll have discovered it by now.
-4. `rhandsontable`: Based on `Handsontable.js`, this allows for some nice formatting of tables.
+4. `DT`: Based on `datatable.js`, this allows for some nice formatting of tables.
 5. `googleVis`: A gauge is given as monitoring the metric of probability of correct classification.
 6. `magrittr`: A package with extended pipe cases.
 
@@ -87,8 +87,8 @@ library( tidyverse )
 library( e1071 )
 # scales for percentage formatting
 library( scales )
-# rhandsontable for sample results
-library( rhandsontable )
+# DT for sample results
+library( DT )
 # googleVis for monitoring via gauge
 library( googleVis )
 # magrittr for the double pipe -- I'm a fan, but it's a bit controversial....
@@ -248,34 +248,17 @@ sampleResults <- function( augData
 }
 
 makeResultsTable <- function( tableData ){
-  resultsTable <- rhandsontable( 
-    tableData
+  resultsTable <- DT::datatable( 
+    tableData %>% mutate( Correct=as.character( Correct ) )
     # Turn off rownames
-    , rowHeaders = NULL
-    , row_highlight=
-      # The underlying JS is 0-based, hence the "-1"
-      (which( !tableData$Correct, arr.ind=TRUE )-1) ) %>%
-    # The rhandsontable documentation has some good examples of JS to highlight. 
-    # Once you have some good examples, you can re-use them easily!
-    hot_cols( renderer="
-            function(instance, td, row, col, prop, value, cellProperties) {
-              Handsontable.renderers.TextRenderer.apply(this, arguments);
-      
-              tbl = this.HTMLWidgets.widgets[0]
+    , rownames = FALSE
+ ) %>%
+    formatRound( c('Fare', 'effFare'), digits=2 ) %>%
+    formatStyle( 'Correct'
+                 , target='row'
+                 , color='white'
+                 , backgroundColor=styleEqual(c('TRUE', 'FALSE'), c('darkgreen', 'red') ) )
 
-              hrows = tbl.params.row_highlight
-              hrows = hrows instanceof Array ? hrows : [hrows] 
-
-              if( hrows.includes( row ) ){
-                  td.style.background = 'red';
-              }
-
-
-              return td;
-            }
-            "
-            )
-  
   # The resulting table is in HTML
   return( resultsTable )
 }
@@ -285,14 +268,14 @@ makeResultsTable <- function( tableData ){
 
 I've played with SVMs in previous jobs. Based on my memory, I tried using a cost ($C$) of $10$, and a $\gamma$ value of $0.1$. I checked this on a small sample of data to see if it (roughly) aligned with the predictions.
 
-```{r svmSimpleFit, results='asis', tidy=FALSE}
+```{r svmSimpleFit, results='asis'}
 simpleSVM <- fitSVM( trainData=trainData
                      , formula='Survived ~ Age + Sex + effFare + Cclass + deck' )
 simpleTrainData <- augmentPredictions( trainData, simpleSVM )
 simpleSample <- sampleResults( simpleTrainData ) %>%
   select( PassengerId, Pclass, Sex, Age, Fare, effFare, Survived, predSurv, Correct )
 
-# The rhandsontable is a nice table to visualise the results, and allows for formatting
+# The DT package is a nice table to visualise the results, and allows for formatting
 simpleTable <- makeResultsTable( simpleSample )
 simpleTable
 
@@ -307,7 +290,7 @@ Although it's unclear (to me) how the family, port, and fare may influence the m
 
 Note that I've excluded the name and identifier variables as I'm not sure how to extend them to the test data.
 
-```{r svmGeneralFit, results='asis', tidy=FALSE}
+```{r svmGeneralFit, results='asis'}
 generalSVM <- fitSVM( trainData, formula='Survived ~ Age + 
                       Sex + 
                       effFare + 
@@ -335,7 +318,7 @@ write.csv( generalOut, file='generalSVM.csv', row.names = FALSE )
 
 Try tuning if you'd like. I did this *twice* using different parameter settings: Once had no change, and the second led to my current submission on the leaderboard. I recommend against running this if you're just after an introduction -- but if you have the time, feel free to change the ranges, settings, and have a go!
 
-```{r tuneSVM, results='asis', tidy=FALSE}
+```{r tuneSVM, results='asis'}
 # Set the random number seed so that this is repeatable
 set.seed( 42 )
 tuneSVM <- tune( svm
@@ -352,8 +335,8 @@ tuneSVM <- tune( svm
                       title_orig
                  , data=trainData 
                  , type='C-classification'
-                 , ranges=list( cost=10^seq( from=-1, to=3, by=0.25 )
-                                , gamma=10^seq(from=-2, to=1, by=0.25 ) )
+                 , ranges=list( cost=10^seq( from=-1, to=3, by=0.5 )
+                                , gamma=10^seq(from=-2, to=1, by=0.5 ) )
                  , tunecontrol=tune.control( sampling='boot' )
 )
 
@@ -379,7 +362,8 @@ swapSet <- tuneTrainData %>%
 
 if( nrow( swapSet ) > 0 ){
   knitr::kable( swapSet %>% sample_n( 5 )
-                , caption='Example differences between tuned and untuned SVMs' )
+                , caption='Example differences between tuned and untuned SVMs' 
+                , digits=2 )
 }
 ```
 
@@ -390,7 +374,7 @@ An attractive feature of SVM is the ability to explicity restrict the complexity
 1. It helps guard against overtraining, and  
 2. It reduces complexity for implementation purposes.
 
-```{r nuSVM, results='asis', tidy=FALSE}
+```{r nuSVM, results='asis'}
 nuSVM <- fitSVM( trainData
                  , formula='Survived ~ Age + 
                       Sex + 
@@ -544,7 +528,7 @@ If there were additional metrics - for instance, the PCC for different segments 
 
 I don't know how my chosen model will work on the private test data, so whether or not my model will be rated green on the private data remains to be seen!
 
-```{r gaugeVis, results='asis', tidy=FALSE, eval=FALSE}
+```{r gaugeVis, results='asis'}
 MAX_GREEN = 1
 MIN_GREEN = 0.8
 MAX_YELLOW = MIN_GREEN
@@ -553,9 +537,9 @@ MAX_RED = MIN_YELLOW
 MIN_RED = 0
 
 gaugeDF <- # Get the metrics....
-  tibble( Overall=getTrainPerf( trainDataNu )
-                       , Men=getTrainPerf( trainDataNu %>% filter( Sex == 'male' ) )
-                       , Women=getTrainPerf( trainDataNu %>% filter( Sex == 'female' ) ) 
+  tibble( Overall=getTrainPerf( nuTrainData )
+                       , Men=getTrainPerf( nuTrainData %>% filter( Sex == 'male' ) )
+                       , Women=getTrainPerf( nuTrainData %>% filter( Sex == 'female' ) ) 
               )%>%
   # Transform from fat & wide to thin & long
   tidyr::gather( key=Metric, value=PCC ) %>%
@@ -584,7 +568,9 @@ In building this, I'd like to thank the following:
 
 1. [Kaggle](https://www.kaggle.com), for hosting the data and the [open competition](https://www.kaggle.com/c/titanic).
 
-2. `jrowan` for the [`rhandsontable` package, and its documentation](http://jrowen.github.io/rhandsontable/)
+2. `jrowan` for the [`rhandsontable` package, and its documentation](http://jrowen.github.io/rhandsontable/). Note that I couldn't get this working on Kaggle, so I switched to `DT`....
+
+2a. RStudio for [releasing and documenting the DT package](https://rstudio.github.io/DT/).
 
 3. [Heads or Tails](https://www.kaggle.com/headsortails) for their [public kernel](https://www.kaggle.com/headsortails/tidy-titarnic).
 
